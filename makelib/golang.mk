@@ -18,6 +18,11 @@
 # The go project including repo name, for example, github.com/rook/rook
 GO_PROJECT ?= $(PROJECT_REPO)
 
+# the packages to be built statically, for example, $(GO_PROJECT)/cmd/mytool
+ifeq ($(GO_STATIC_PACKAGES),)
+$(error please set GO_STATIC_PACKAGES prior to including golang.mk)
+endif
+
 # Optional. These are subdirs that we look for all go files to test, vet, and fmt
 GO_SUBDIRS ?= cmd pkg
 
@@ -81,6 +86,7 @@ DEP := $(TOOLS_HOST_DIR)/dep-$(DEP_VERSION)
 GOJUNIT := $(TOOLS_HOST_DIR)/go-junit-report
 GOCOVER_COBERTURA := $(TOOLS_HOST_DIR)/gocover-cobertura
 GOIMPORTS := $(TOOLS_HOST_DIR)/goimports
+CONTROLLERGEN := $(TOOLS_HOST_DIR)/controller-gen
 
 GO := go
 GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
@@ -132,15 +138,29 @@ endif
 GO_COMMON_FLAGS = $(GO_BUILDFLAGS) -tags '$(GO_TAGS)'
 GO_STATIC_FLAGS = $(GO_COMMON_FLAGS) $(GO_PKG_STATIC_FLAGS) -installsuffix static  -ldflags '$(GO_LDFLAGS)'
 
+GO_INIT_REQUIRED_TARGETS = go.vendor.lite
+GO_VENDOR_TARGET = go.vendor
+# switch for go modules
+ifeq ($(GO111MODULE),on)
+# no GOPATH is set, since go modules are being used
+export GOPATH= 
+export GO111MODULE=on
+
+GO_STATIC_FLAGS += -mod=vendor
+GO_INIT_REQUIRED_TARGETS = go.mod.verify
+GO_VENDOR_TARGET = go.mod.vendor
+
+endif
+
 # ====================================================================================
 # Go Targets
 
-go.init: go.vendor.lite
+go.init: $(GO_INIT_REQUIRED_TARGETS)
 	@if ! `$(GO) version | grep -q -E '\bgo($(GO_SUPPORTED_VERSIONS))\b'`; then \
 		$(ERR) unsupported go version. Please make install one of the following supported version: '$(GO_SUPPORTED_VERSIONS)' ;\
 		exit 1 ;\
 	fi
-	@if [ "$(realpath ../../../..)" !=  "$(realpath $(GOPATH))" ]; then \
+	@if [ "$(GO111MODULE)" != "on" ] && [ "$(realpath ../../../..)" !=  "$(realpath $(GOPATH))" ]; then \
 		$(WARN) the source directory is not relative to the GOPATH at $(GOPATH) or you are you using symlinks. The build might run into issue. Please move the source directory to be at $(GOPATH)/src/$(GO_PROJECT) ;\
 	fi
 
@@ -148,6 +168,7 @@ go.build:
 	@$(INFO) go build $(PLATFORM)
 	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=0 $(GO) build -v -i -o $(GO_OUT_DIR)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p) || $(FAIL) ${\n})
 	$(foreach p,$(GO_TEST_PACKAGES) $(GO_LONGHAUL_TEST_PACKAGES),@CGO_ENABLED=0 $(GO) test -i -c -o $(GO_TEST_OUTPUT)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p) || $(FAIL ${\n}))
+	@$(MAKE) go.writeable.mod.folder
 	@$(OK) go build $(PLATFORM)
 
 go.install:
@@ -167,6 +188,7 @@ else
 	@cat $(GO_TEST_OUTPUT)/unit-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/unit-tests.xml || $(FAIL)
 	@$(GOCOVER_COBERTURA) < $(GO_TEST_OUTPUT)/coverage.txt > $(GO_TEST_OUTPUT)/coverage.xml
 endif
+	@$(MAKE) go.writeable.mod.folder
 	@$(OK) go test unit-tests
 
 # Depends on go.test.unit, but is only run in CI with a valid token after unit-testing is complete
@@ -182,6 +204,7 @@ go.test.integration: $(GOJUNIT)
 	@CGO_ENABLED=0 $(GOHOST) test -i $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) || $(FAIL)
 	@CGO_ENABLED=0 $(GOHOST) test $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) $(TEST_FILTER_PARAM) 2>&1 | tee $(GO_TEST_OUTPUT)/integration-tests.log || $(FAIL)
 	@cat $(GO_TEST_OUTPUT)/integration-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/integration-tests.xml || $(FAIL)
+	@$(MAKE) go.writeable.mod.folder
 	@$(OK) go test integration-tests
 
 go.lint: $(GOLANGCILINT)
@@ -241,21 +264,40 @@ go.vendor: $(DEP)
 	@$(DEP) ensure || $(FAIL)
 	@$(OK) dep ensure
 
+go.mod.verify:
+	@$(INFO) verify dependencies have expected content
+	@$(GO) mod verify || $(FAIL)
+	@$(OK) go modules dependencies verified
+
+go.mod.vendor:
+	@$(INFO) go mod vendor
+	@$(GO) mod vendor || $(FAIL)
+	@$(MAKE) go.writeable.mod.folder
+	@$(OK) go mod vendor
+
+# makes sure the pkg/mod folder is writable (otherwise it won't be deleted)
+go.writeable.mod.folder:
+	@echo 
+	@#check if go modules is enabled
+ifeq ($(GO111MODULE),on)
+	@test -d $(shell go env GOPATH)/pkg/mod && find $(shell go env GOPATH)/pkg/mod -type d -exec chmod 777 {} \; || echo 
+endif
+
 go.clean:
 	@rm -fr $(GO_BIN_DIR) $(GO_TEST_DIR)
 
 go.distclean:
 	@rm -rf $(GO_VENDOR_DIR) $(GO_PKG_DIR)
 
-go.generate: $(GOIMPORTS)
+go.generate: $(GOIMPORTS) $(CONTROLLERGEN)
 	@$(INFO) go generate $(PLATFORM)
-	@CGO_ENABLED=0 $(GOHOST) generate $(GO_COMMON_FLAGS) $(GO_PACKAGES) $(GO_INTEGRATION_TEST_PACKAGES) || $(FAIL)
-	@$(OK) go generate $(PLATFORM)
+	@CGO_ENABLED=0 CONTROLLERGEN=$(CONTROLLERGEN) $(GOHOST) generate $(GO_COMMON_FLAGS) $(GO_PACKAGES) $(GO_INTEGRATION_TEST_PACKAGES) || $(FAIL)
 	@find $(GO_SUBDIRS) $(GO_INTEGRATION_TESTS_SUBDIRS) -type f -name 'zz_generated*' -exec $(GOIMPORTS) -l -w -local $(GO_PROJECT) {} \;
+	@$(OK) go generate $(PLATFORM)
 
 
 .PHONY: go.init go.build go.install go.test.unit go.test.integration go.test.codecov go.lint go.vet go.fmt go.generate
-.PHONY: go.validate go.vendor.lite go.vendor go.vendor.check go.vendor.update go.clean go.distclean
+.PHONY: go.validate go.vendor.lite go.vendor go.vendor.check go.vendor.update go.clean go.distclean go.mod.vendor go.mod.verify
 
 # ====================================================================================
 # Common Targets
@@ -277,7 +319,7 @@ fmt: go.imports
 fmt.simplify: go.fmt.simplify
 imports: go.imports
 imports.fix: go.imports.fix
-vendor: go.vendor
+vendor: $(GO_VENDOR_TARGET)
 vendor.check: go.vendor.check
 vendor.update: go.vendor.update
 vet: go.vet
@@ -293,6 +335,8 @@ Go Targets:
     vendor          Updates vendor packages.
     vendor.check    Fail the build if vendor packages have changed.
     vendor.update   Update vendor dependencies.
+    go.mod.verify      Verify go module dependencies have expected content.
+    go.mod.vendor      Makes vendored copy of go modules dependencies.
     vet             Checks go source code and reports suspicious constructs.
     test.unit.nocov Runs unit tests without coverage (faster for iterative development)
 endef
@@ -333,22 +377,23 @@ $(GOFMT):
 	@$(OK) installing gofmt$(GOFMT_VERSION)
 
 $(GOIMPORTS):
-	@$(INFO) installing goimports
-	@mkdir -p $(TOOLS_HOST_DIR)/tmp-imports || $(FAIL)
-	@GOPATH=$(TOOLS_HOST_DIR)/tmp-imports GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get -u golang.org/x/tools/cmd/goimports || rm -fr $(TOOLS_HOST_DIR)/tmp-imports || $(FAIL)
-	@rm -fr $(TOOLS_HOST_DIR)/tmp-imports
-	@$(OK) installing goimports
+	@$(MAKE) go.get GOPKG=golang.org/x/tools/cmd/goimports
 
 $(GOJUNIT):
-	@$(INFO) installing go-junit-report
-	@mkdir -p $(TOOLS_HOST_DIR)/tmp-junit || $(FAIL)
-	@GOPATH=$(TOOLS_HOST_DIR)/tmp-junit GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get github.com/jstemmer/go-junit-report || rm -fr $(TOOLS_HOST_DIR)/tmp-junit || $(FAIL)
-	@rm -fr $(TOOLS_HOST_DIR)/tmp-junit
-	@$(OK) installing go-junit-report
+	@$(MAKE) go.get GOPKG=github.com/jstemmer/go-junit-report
 
-$(GOCOVER_COBERTURA):
-	@$(INFO) installing gocover-cobertura
-	@mkdir -p $(TOOLS_HOST_DIR)/tmp-gocover-cobertura || $(FAIL)
-	@GOPATH=$(TOOLS_HOST_DIR)/tmp-gocover-cobertura GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get github.com/t-yuki/gocover-cobertura || rm -fr $(TOOLS_HOST_DIR)/tmp-covcover-cobertura || $(FAIL)
-	@rm -fr $(TOOLS_HOST_DIR)/tmp-gocover-cobertura
-	@$(OK) installing gocover-cobertura
+$(GOCOVER_COBERTURA): $(GOJUNIT)
+	@$(MAKE) go.get GOPKG=github.com/t-yuki/gocover-cobertura
+
+$(CONTROLLERGEN):
+	@$(MAKE) go.get GOPKG=sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.1
+
+go.get:
+	@$(INFO) installing $(GOPKG)
+	@GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get $(GOPKG) || $(FAIL)
+	@# the below command reverts the go.mod modification because of running `go get`
+	@# otherwise the build becomes dirty and won't be published
+ifeq ($(GO111MODULE),on)
+	@$(GOHOST) mod tidy
+endif
+	@$(OK) installed $(GOPKG)
